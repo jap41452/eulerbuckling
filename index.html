@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ColumnX — Vertical Column Builder (Euler Buckling — streamlined)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.min.css">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #f7f7f9; margin: 0; color:#111; }
+    .toolbar { padding: 10px; background: #ffffff; border-bottom: 1px solid #d0d5dd; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .toolbar label { color:#111; }
+    .toolbar input { padding: 6px; border: 1px solid #d0d5dd; border-radius: 4px; background:#ffffff; color:#111; }
+    .toolbar input[type="number"]{ width: 80px; }
+    .btn { padding: 8px 14px; cursor: pointer; border: 1px solid #9ca3af; border-radius: 4px; background: #e5e7eb; color:#111; font-weight: 600; }
+    .btn.primary { background: #e5e7eb; border-color:#9ca3af; color:#111; }
+    canvas { background: #ffffff; border: 1px solid #d0d5dd; display: block; margin: 10px; border-radius: 8px; }
+
+    /* SweetAlert — match beam/static-beam look */
+    .swal2-popup { font-size: 12px !important; width: auto !important; min-width: 250px !important; }
+    .swal2-input, .swal2-select { font-size: 12px !important; width: 120px !important; margin: 5px !important; }
+    .swal2-html-container label { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+    .swal2-html-container label span { margin-right: 10px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <label># Segments <input type="number" id="numSegments" min="1" max="5" value="4"></label>
+    <button id="buildBtn" class="btn">Build</button>
+    <button id="bucklingBtn" class="btn">Euler Buckling</button>
+    <!-- Streamlined Euler-only tool; other controls removed -->
+  </div>
+  <canvas id="columnCanvas" width="378" height="420"></canvas>
+
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/numeric/1.2.6/numeric.min.js"></script>
+  <script>
+  'use strict';
+  // ==== Data Model ====
+  let segments = [];
+  let nodes = [];
+  let clickTargets = []; // {type:'segment'|'node', index, x,y,w,h}
+  let lastBuckling = { Pcr: null, mode: null }; // remember last buckling result for canvas overlay
+  let lastNonlinear = null; // (kept for future use)
+  let nlState = { running:false, timer:null }; // animation control
+
+  // Helpers to summarize model and compute analytical Pc when applicable
+  function modelSummary(){
+    const Ltot = segments.reduce((s,g)=>s + (Number(g.L)||0), 0);
+    const Ein = segments.map(g=>Number(g.E)||0);
+    const Iin = segments.map(g=>Number(g.I)||0);
+    const allEeq = Ein.length>0 && Ein.every(v=>v===Ein[0] && v>0);
+    const allIeq = Iin.length>0 && Iin.every(v=>v===Iin[0] && v>0);
+    const uniform = allEeq && allIeq;
+    const EI = uniform ? (Ein[0]*Iin[0]) : null;
+    const topBC = nodes[0]?.bc || '';
+    const botBC = nodes[nodes.length-1]?.bc || '';
+    return {Ltot, uniform, EI, topBC, botBC};
+  }
+  function analyticPcForCurrent(){
+    const {Ltot, uniform, EI, topBC, botBC} = modelSummary();
+    if (!uniform || !(Ltot>0 && EI>0)) return null;
+    let K = null; // effective length factor
+    if ((topBC==='simply supported'||topBC==='pinned') && (botBC==='simply supported'||botBC==='pinned')) K = 1.0; // pinned–pinned
+    else if ((topBC==='simply supported'||topBC==='pinned') && botBC==='fixed') K = 0.699; // fixed–pinned
+    else if (topBC==='fixed' && botBC==='fixed') K = 0.5; // fixed–fixed
+    else return null;
+    return Math.PI*Math.PI*EI/((K*Ltot)*(K*Ltot));
+  }
+
+  const defaultSegment = { L: 24.0, E: 12000000, I: 3 }; // presets: 24in per segment for 4 seg => 96in total
+  const defaultNode    = { bc: 'free', kLat: 0, kTor: 0 };
+
+  const canvas = document.getElementById('columnCanvas');
+  const ctx = canvas.getContext('2d');
+
+  function initModel(n) {
+    segments = Array.from({ length: n }, () => ({ ...defaultSegment }));
+    // enforce preset totals: L_total = 96, E = 12,000,000, I = 3
+    const Lper = 96 / n;
+    for (let i=0;i<n;i++) { segments[i].L = Lper; segments[i].E = 12000000; segments[i].I = 3; }
+    nodes    = Array.from({ length: n + 1 }, () => ({ ...defaultNode }));
+    // default: cantilever — top free, bottom fixed
+    nodes[0].bc = 'free';
+    nodes[n].bc = 'fixed';
+    lastBuckling = { Pcr: null, mode: null };
+  }
+
+  function fmt(v){ if(!isFinite(v)) return String(v); const a=Math.abs(v); return (a>=1e6||a<=1e-3)?Number(v).toExponential(3):Number(v).toFixed(3).replace(/\.000$/,''); }
+
+  function buildColumn() {
+    const n = Math.min(5, Math.max(1, parseInt(document.getElementById('numSegments').value) || 1));
+    initModel(n);
+    if (nlState.running){ clearTimeout(nlState.timer); nlState.running=false; }
+    lastNonlinear = null;
+    drawColumn();
+  }
+
+  // ==== Drawing ====
+  function drawColumn(buckling) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    clickTargets = [];
+
+    const totalLraw = segments.reduce((s, seg) => s + (Number(seg.L)||0), 0);
+    const totalL = totalLraw > 0 ? totalLraw : Math.max(1, segments.length);
+    const EIvals = segments.map(seg => (Number(seg.E)||0) * (Number(seg.I)||0));
+    const maxEI  = Math.max(0, ...EIvals);
+
+    const topY = 60;
+    const cx = canvas.width / 2;
+    const scale = (canvas.height - 140) / totalL; // px per unit length
+
+    const nodeYs = [topY];
+    for (let i = 0; i < segments.length; i++) {
+      const h = Math.max(0, Number(segments[i].L)||0) * scale;
+      nodeYs.push(nodeYs[nodeYs.length-1] + h);
+    }
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const h = Math.max(0, Number(seg.L)||0) * scale;
+      const rel = (maxEI>0) ? Math.sqrt(Math.max(0, (Number(seg.E)||0)*(Number(seg.I)||0)) / maxEI) : 1;
+      const width = 11 * (isFinite(rel) && rel>0 ? rel : 1);
+      const yTop = nodeYs[i];
+
+      // segment body (dark gray)
+      ctx.fillStyle = '#777';
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.rect(cx - width / 2, yTop, width, h);
+      ctx.fill();
+      ctx.stroke();
+
+      // segment values label (L, E, I) to the right of the segment
+      ctx.fillStyle = '#111';
+      ctx.font = '12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const segLabel = `L=${fmt(seg.L)}  E=${fmt(seg.E)}  I=${fmt(seg.I)}`;
+      ctx.fillText(segLabel, cx + width/2 + 8, yTop + h/2);
+
+      // segment click target
+      clickTargets.push({ type: 'segment', index: i, x: cx - width/2, y: yTop, w: width, h: h });
+
+      // top node of this segment
+      drawNode(cx, yTop, i);
+    }
+    // bottom node
+    drawNode(cx, nodeYs[nodeYs.length-1], segments.length);
+
+    // Optional: overlay buckling mode shape (supports refined or primary)
+    if (buckling) {
+      let refined = false;
+      let vArray = null; // array of lateral displ at draw nodes
+      let yArray = null; // corresponding y positions
+
+      if (buckling.modeRef && Array.isArray(buckling.modeRef)) {
+        // Use refined mode (smoother): build refined y positions
+        refined = true;
+        const splits = buckling.splits || 6;
+        const nRefNodes = buckling.nRefNodes || ((nodes.length-1)*splits + 1);
+        vArray = [];
+        for (let r=0;r<nRefNodes;r++) vArray.push(buckling.modeRef[2*r]);
+        // y positions: subdivide each primary span equally
+        yArray = [];
+        for (let i=0;i<segments.length;i++){
+          const Lm = Number(segments[i].L)||0;
+          const Hp = Lm * scale;
+          const y0 = nodeYs[i];
+          for (let s=0;s<splits;s++) yArray.push(y0 + Hp * (s/splits));
+        }
+        yArray.push(nodeYs[nodeYs.length-1]); // last node
+      } else if (Array.isArray(buckling) || (buckling.mode && Array.isArray(buckling.mode))) {
+        // Back-compat: primary mode only
+        const modeShape = Array.isArray(buckling) ? buckling : buckling.mode;
+        vArray = [];
+        for (let i=0;i<nodes.length;i++) vArray.push(modeShape[2*i]);
+        yArray = nodeYs.slice();
+      }
+
+      if (vArray && yArray) {
+        const vmax = Math.max(1e-12, Math.max.apply(null, vArray.map(Math.abs)));
+        // Use fixed gain during nonlinear animation (passed in), otherwise auto-normalize
+        let gain;
+        if (buckling && typeof buckling.vGain === 'number') {
+          gain = buckling.vGain;
+          // Clamp if it would push shape out of canvas
+          const maxPx = Math.max.apply(null, vArray.map(v=>Math.abs(v)*gain));
+          const safe = canvas.width * 0.42; // leave margins
+          if (maxPx > safe && maxPx > 0) gain *= (safe / maxPx);
+        } else {
+          gain = 60 / vmax; // default auto normalization
+        }
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i=0;i<vArray.length;i++){
+          const xx = cx + gain * vArray[i];
+          const yy = yArray[i];
+          if (i===0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+        }
+        ctx.stroke();
+
+        // draw small dots at PRIMARY nodes only (for clarity)
+        for (let i=0;i<nodes.length;i++){
+          const splits = buckling.splits || 6;
+          const xx = cx + gain * (refined ? buckling.modeRef[2*(i*splits)] : vArray[i]);
+          const yy = nodeYs[i];
+          ctx.beginPath(); ctx.arc(xx, yy, 2.5, 0, Math.PI*2); ctx.fillStyle = '#ef4444'; ctx.fill();
+        }
+      }
+    }
+
+    // === Buckling Load Overlay ===
+    if (lastBuckling.Pcr != null && isFinite(lastBuckling.Pcr)) {
+      const pad = 10;
+      const Pcur = (buckling && typeof buckling.currentP === 'number' && isFinite(buckling.currentP)) ? buckling.currentP : null;
+      const Pth = analyticPcForCurrent();
+      const lines = [];
+      const stepTxt = (buckling && buckling.stepText) ? buckling.stepText : null;
+      if (stepTxt) lines.push(stepTxt);
+      if (Pcur != null) lines.push(`P = ${fmt(Pcur)}`);
+      lines.push(`Pcr = ${fmt(lastBuckling.Pcr)}`);
+      if (Pth!=null) lines.push(`Pth ≈ ${fmt(Pth)}`);
+
+      ctx.font = '13px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+      const widths = lines.map(t=>ctx.measureText(t).width + 14);
+      const W = Math.max.apply(null, widths);
+      const lineH = 18; const H = 10 + lineH*lines.length + 6;
+
+      // badge background
+      ctx.fillStyle = 'rgba(255,255,255,0.95)';
+      ctx.strokeStyle = '#cccccc';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(pad, pad, W, H, 6); else ctx.rect(pad, pad, W, H);
+      ctx.fill();
+      ctx.stroke();
+
+      // text lines
+      ctx.fillStyle = '#111';
+      ctx.textBaseline = 'top';
+      for (let i=0;i<lines.length;i++){
+        ctx.fillText(lines[i], pad + 7, pad + 6 + i*lineH);
+      }
+    }
+  }
+
+  function drawNode(x, y, idx) {
+    const node = nodes[idx];
+    // Enlarged click area
+    clickTargets.push({ type: 'node', index: idx, x: x - 18, y: y - 18, w: 36, h: 36 });
+
+    // Node marker
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+
+    // BC symbols (Beam-style, rotated for vertical column view)
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    if (node.bc === 'fixed') {
+      // horizontal line through node center + 3 downward slanted hatch lines
+      ctx.beginPath(); ctx.moveTo(x - 18, y); ctx.lineTo(x + 18, y); ctx.stroke();
+      for (let k=0; k<3; k++){
+        const x0 = x - 14 + k*14;
+        ctx.beginPath(); ctx.moveTo(x0, y+3); ctx.lineTo(x0+8, y+15); ctx.stroke();
+      }
+    } else if (node.bc === 'simply supported' || node.bc === 'pinned') {
+      // small triangle to the LEFT pointing toward node
+      ctx.beginPath();
+      ctx.moveTo(x - 10, y);
+      ctx.lineTo(x - 22, y - 10);
+      ctx.lineTo(x - 22, y + 10);
+      ctx.closePath(); ctx.stroke();
+    } else {
+      // free: open circle
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI*2); ctx.stroke();
+    }
+
+    // Springs
+    if ((Number(node.kLat)||0) > 0) {
+      // connector line from node to spring
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 12, y); ctx.stroke();
+      drawLateralSpring(x + 12, y, 30, 8);
+      // label K_L near spring with numeric value
+      drawSubscriptLabelValue(x + 12 + 30 + 8, y - 8, 'K', 'L', node.kLat);
+    }
+    if ((Number(node.kTor)||0) > 0) {
+      drawVerticalTorsionalSprings(x, y, 20, 8);
+      // label K_T farther from torsional spring to avoid overlap
+      drawSubscriptLabelValue(x + 90, y - 12, 'K', 'T', node.kTor);
+    }
+  }
+
+  function drawLateralSpring(startX, startY, length, amplitude) {
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(startX, startY);
+    const seg = length / 6;
+    for (let i = 0; i < 3; i++) {
+      ctx.lineTo(startX + seg * (i * 2 + 1), startY - amplitude);
+      ctx.lineTo(startX + seg * (i * 2 + 2), startY + amplitude);
+    }
+    ctx.stroke();
+  }
+
+  // Draw subscript label with a numeric value, e.g., K_L = 1000
+  function drawSubscriptLabelValue(x, y, mainChar, subChar, value){
+    // label
+    const baseFont = '13px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+    const subFont  = '10px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+    ctx.fillStyle = '#111';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = baseFont;
+    ctx.fillText(mainChar, x, y);
+    const wMain = ctx.measureText(mainChar).width;
+    ctx.font = subFont;
+    ctx.fillText(subChar, x + wMain, y + 3);
+    // value to the right
+    ctx.font = '12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+    const wSub = ctx.measureText(subChar).width;
+    const xVal = x + wMain + wSub + 6;
+    ctx.fillText('= ' + fmt(value), xVal, y);
+  }
+
+  // Torsional spring per user spec: two vertical axial springs, one up (right), one down (left),
+  // separated laterally, with a horizontal connector through the node center.
+  function drawVerticalTorsionalSprings(centerX, centerY, length, amplitude) {
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    const offset = 30; // lateral spacing from node center
+    const seg = length / 6;
+
+    // Upward spring on right side
+    ctx.beginPath();
+    ctx.moveTo(centerX + offset, centerY);
+    for (let i = 0; i < 3; i++) {
+      ctx.lineTo(centerX + offset + amplitude, centerY - seg * (i * 2 + 1));
+      ctx.lineTo(centerX + offset - amplitude, centerY - seg * (i * 2 + 2));
+    }
+    ctx.stroke();
+
+    // Downward spring on left side
+    ctx.beginPath();
+    ctx.moveTo(centerX - offset, centerY);
+    for (let i = 0; i < 3; i++) {
+      ctx.lineTo(centerX - offset - amplitude, centerY + seg * (i * 2 + 1));
+      ctx.lineTo(centerX - offset + amplitude, centerY + seg * (i * 2 + 2));
+    }
+    ctx.stroke();
+
+    // Horizontal connector through node center
+    ctx.beginPath();
+    ctx.moveTo(centerX - offset, centerY);
+    ctx.lineTo(centerX + offset, centerY);
+    ctx.stroke();
+  }
+
+  // ==== Editors (SweetAlert) — identical layout to beam apps ====
+  function editSegment(i) {
+    const seg = segments[i];
+    Swal.fire({
+      title: `Segment ${i + 1} Properties`,
+      html:
+        `<label><span>L:</span><input id="swal-L" class="swal2-input" type="number" step="any" value="${seg.L}"></label>
+         <label><span>E:</span><input id="swal-E" class="swal2-input" type="number" step="any" value="${seg.E}"></label>
+         <label><span>I:</span><input id="swal-I" class="swal2-input" type="number" step="any" value="${seg.I}"></label>`,
+      focusConfirm: false,
+      preConfirm: () => {
+        const L = parseFloat(document.getElementById('swal-L').value);
+        const E = parseFloat(document.getElementById('swal-E').value);
+        const I = parseFloat(document.getElementById('swal-I').value);
+        if (!(L>0 && E>0 && I>0)) {
+          Swal.showValidationMessage('L, E, and I must be > 0');
+          return false;
+        }
+        segments[i].L = L; segments[i].E = E; segments[i].I = I;
+        lastBuckling = { Pcr: null, mode: null }; // invalidate prior result
+      }
+    }).then((res)=>{ if (res.isConfirmed) drawColumn(); });
+  }
+
+  function editNode(i) {
+    const node = nodes[i];
+    Swal.fire({
+      title: `Node ${i + 1} Properties`,
+      html:
+        `<label><span>BC:</span><select id="swal-bc" class="swal2-select">
+            <option value="free" ${node.bc==='free'?'selected':''}>Free</option>
+            <option value="simply supported" ${(node.bc==='simply supported'||node.bc==='pinned')?'selected':''}>Simply Supported</option>
+            <option value="fixed" ${node.bc==='fixed'?'selected':''}>Fixed</option>
+          </select></label>
+         <label><span>kLat:</span><input id="swal-klat" class="swal2-input" type="number" step="any" min="0" value="${node.kLat}"></label>
+         <label><span>kTor:</span><input id="swal-ktor" class="swal2-input" type="number" step="any" min="0" value="${node.kTor}"></label>`,
+      focusConfirm: false,
+      preConfirm: () => {
+        const bc   = document.getElementById('swal-bc').value;
+        const kLat = parseFloat(document.getElementById('swal-klat').value);
+        const kTor = parseFloat(document.getElementById('swal-ktor').value);
+        if (!(kLat>=0 && kTor>=0)) {
+          Swal.showValidationMessage('Springs must be \u2265 0');
+          return false;
+        }
+        nodes[i].bc = bc; nodes[i].kLat = kLat; nodes[i].kTor = kTor;
+        lastBuckling = { Pcr: null, mode: null }; // invalidate prior result
+      }
+    }).then((res)=>{ if (res.isConfirmed) drawColumn(); });
+  }
+
+  // ==== Interaction ====
+  canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    // Reverse so nodes (added later) get priority over segments
+    for (let i = clickTargets.length - 1; i >= 0; i--) {
+      const t = clickTargets[i];
+      if (mx >= t.x && mx <= t.x + t.w && my >= t.y && my <= t.y + t.h) {
+        if (t.type === 'segment') { editSegment(t.index); }
+        else if (t.type === 'node') { editNode(t.index); }
+        return;
+      }
+    }
+  });
+
+  // Hermite shape function (kept for reference)
+  function hermiteV(vi, thi, vj, thj, L, xi){ // xi in [0,1]
+    const xi2 = xi*xi, xi3 = xi2*xi;
+    const N1 = 1 - 3*xi2 + 2*xi3;
+    const N2 = L * (xi - 2*xi2 + xi3);
+    const N3 = 3*xi2 - 2*xi3;
+    const N4 = L * (-xi2 + xi3);
+    return N1*vi + N2*thi + N3*vj + N4*thj;
+  }
+
+  // ==== Buckling (Eigenvalue) ====
+  // DOFs per node: [v, theta]
+  function assembleGlobalMatrices(){
+    // Build a refined internal mesh: each user segment is split into 6 equal subelements,
+    // creating 5 internal sub-nodes between the primary nodes. These sub-nodes are NOT
+    // drawn or clickable; they're only used to improve the solution accuracy.
+    const nPrim = nodes.length;                 // primary nodes count
+    const splits = 6;                           // 5 sub-nodes => 6 subelements
+    const nRefNodes = (nPrim - 1) * splits + 1; // refined node count
+    const ndofRef = nRefNodes * 2;              // [v, theta] per refined node
+
+    // Assemble global K and Kg (unit) on the refined mesh
+    let K = numeric.rep([ndofRef, ndofRef], 0);
+    let Kg_unit = numeric.rep([ndofRef, ndofRef], 0);
+
+    // Loop primary segments, split each into 'splits' pieces
+    for (let e=0; e<segments.length; e++){
+      const Lseg = Number(segments[e].L)||0;
+      const Eseg = Number(segments[e].E)||0;
+      const Iseg = Number(segments[e].I)||0;
+      if (Lseg<=0 || Eseg<=0 || Iseg<=0) continue;
+      const Lsub = Lseg / splits;
+
+      // refined node index of primary node e is r_i = e*splits
+      // refined node index of primary node e+1 is r_j = (e+1)*splits
+      for (let s=0; s<splits; s++){
+        const ri = e*splits + s;       // refined node at sub-element start
+        const rj = ri + 1;             // refined node at sub-element end
+        const map = [2*ri, 2*ri+1, 2*rj, 2*rj+1];
+        const Ke = elemKe(Eseg, Iseg, Lsub);
+        const Kg = elemKg_unit(Lsub); // geometric stiffness for P=1
+        addSubmatrix(K, Ke, map);
+        addSubmatrix(Kg_unit, Kg, map);
+      }
+    }
+
+    // Nodal springs: apply only at primary nodes → refined indices r = p*splits
+    for (let p=0; p<nPrim; p++){
+      const r = p * splits; // refined node index corresponding to primary node p
+      const kL = Number(nodes[p].kLat)||0;
+      const kT = Number(nodes[p].kTor)||0;
+      if (kL>0) K[2*r][2*r] += kL;
+      if (kT>0) K[2*r+1][2*r+1] += kT;
+    }
+
+    // Boundary conditions: decide free DOFs on refined mesh using primary node BCs at r=p*splits
+    const free = [];
+    for (let r=0; r<nRefNodes; r++){
+      // Determine if this refined node corresponds to a primary node
+      if (r % splits === 0){
+        const p = r / splits; // primary node index
+        const bc = nodes[p].bc;
+        const v = 2*r, th = 2*r+1;
+        if (bc === 'fixed'){
+          // both constrained
+        } else if (bc === 'simply supported' || bc === 'pinned'){
+          // v constrained; rotation free
+          free.push(th);
+        } else { // 'free'
+          free.push(v); free.push(th);
+        }
+      } else {
+        // interior refined node (no BC) → both DOFs free
+        free.push(2*r); free.push(2*r+1);
+      }
+    }
+
+    // Reduce
+    const Kr = submatrix(K, free);
+    const Kg_r = submatrix(Kg_unit, free);
+    return {Kr, Kg_r, free, nPrim, nRefNodes, splits};
+  }
+
+  function elemKe(E,I,L){
+    const L2 = L*L, L3 = L2*L;
+    const c = E*I/L3;
+    // 4x4
+    return [
+      [ 12*c,  6*L*c, -12*c,  6*L*c],
+      [ 6*L*c, 4*L2*c, -6*L*c, 2*L2*c],
+      [-12*c, -6*L*c,  12*c, -6*L*c],
+      [ 6*L*c, 2*L2*c, -6*L*c, 4*L2*c]
+    ];
+  }
+  function elemKg_unit(L){
+    // geometric stiffness for unit compressive axial load P=1
+    // Kg = (1/(30L)) * [[36, 3L, -36, 3L],[3L, 4L^2, -3L, -L^2],[-36, -3L, 36, -3L],[3L, -L^2, -3L, 4L^2]]
+    const L2 = L*L;
+    const c = 1/(30*L);
+    return [
+      [ 36*c,   3*L*c, -36*c,   3*L*c],
+      [ 3*L*c,  4*L2*c, -3*L*c, -1*L2*c],
+      [-36*c, -3*L*c,  36*c,  -3*L*c],
+      [ 3*L*c, -1*L2*c, -3*L*c, 4*L2*c]
+    ];
+  }
+
+  function addSubmatrix(K, Ke, map){
+    for (let a=0;a<map.length;a++){
+      for (let b=0;b<map.length;b++){
+        K[map[a]][map[b]] += Ke[a][b];
+      }
+    }
+  }
+  function submatrix(A, idx){
+    const n = idx.length; const R = numeric.rep([n,n],0);
+    for (let i=0;i<n;i++) for (let j=0;j<n;j++) R[i][j] = A[idx[i]][idx[j]];
+    return R;
+  }
+  function expandVector(vr, free, ndof){
+    const v = numeric.rep([ndof], 0);
+    for (let i=0;i<free.length;i++) v[free[i]] = vr[i];
+    return v;
+  }
+
+  function computeEulerBuckling(){
+    const {Kr, Kg_r, free, nPrim, nRefNodes, splits} = assembleGlobalMatrices();
+    // Buckling: (K - P Kg) φ = 0  ⇒  (K^{-1}Kg) φ = (1/P) φ
+    const M = solveMatrix(Kr, Kg_r);
+    const eig = numeric.eig(M);
+
+    const lambdas = Array.from(eig.lambda.x).map(Number);
+    const eigVecs = eig.E.x; // columns
+
+    const pairs = [];
+    for (let k=0;k<lambdas.length;k++){
+      const lam = lambdas[k];
+      if (isFinite(lam) && lam > 1e-18) {
+        const P = 1/lam;
+        const col = eigVecs.map(row => row[k]);
+        pairs.push({P, col});
+      }
+    }
+    pairs.sort((a,b)=>a.P - b.P);
+    if (!pairs.length) throw new Error('No positive eigenvalue found.');
+
+    const ndofRef = nRefNodes*2;
+    function expandRef(vred){ return expandVector(vred, free, ndofRef); }
+    function toPrimary(vRefFull){
+      const modePrim = numeric.rep([nPrim*2], 0);
+      for (let p=0;p<nPrim;p++){
+        const r = p * splits;
+        modePrim[2*p]   = vRefFull[2*r];
+        modePrim[2*p+1] = vRefFull[2*r+1];
+      }
+      return modePrim;
+    }
+
+    for (const pr of pairs){
+      const vRefFull = expandRef(pr.col);
+      const modePrim = toPrimary(vRefFull);
+      const vs = [];
+      for (let i=0;i<nPrim;i++) vs.push(modePrim[2*i]);
+      const vmax = Math.max.apply(null, vs.map(x=>Math.abs(x)));
+      if (isFinite(vmax) && vmax > 1e-10) return {Pcr:pr.P, mode:modePrim, modeRef:vRefFull, splits, nRefNodes};
+    }
+    const p0 = pairs[0];
+    const vRef0 = expandRef(p0.col);
+    return {Pcr:p0.P, mode: toPrimary(vRef0), modeRef:vRef0, splits, nRefNodes};
+  }
+
+  function solveMatrix(A, B){
+    // Solve A X = B where A is square, B is (n x m). Use LU per column.
+    const n = A.length, m = B[0].length;
+    const LU = numeric.LU(A);
+    const X = numeric.rep([n,m], 0);
+    for (let j=0;j<m;j++){
+      const b = [];
+      for (let i=0;i<n;i++) b.push(B[i][j]);
+      const x = numeric.LUsolve(LU, b);
+      for (let i=0;i<n;i++) X[i][j] = x[i];
+    }
+    return X;
+  }
+
+  // === Linear algebra helpers (vectors/matrices) ===
+  function reduceVector(v, idx){ const r = new Array(idx.length); for (let i=0;i<idx.length;i++) r[i] = v[idx[i]]; return r; }
+  function mulMatVec(A, v){ const n=A.length, m=A[0].length; const out=new Array(n).fill(0); for (let i=0;i<n;i++){ let s=0; for (let j=0;j<m;j++){ s += A[i][j]*v[j]; } out[i]=s; } return out; }
+  function vecScale(v, s){ const n=v.length, out=new Array(n); for (let i=0;i<n;i++) out[i]=v[i]*s; return out; }
+  function addMatrices(A,B){ const n=A.length,m=A[0].length; const R=numeric.rep([n,m],0); for (let i=0;i<n;i++) for (let j=0;j<m;j++) R[i][j]=A[i][j]+B[i][j]; return R; }
+  function scaleMatrix(A,s){ const n=A.length,m=A[0].length; const R=numeric.rep([n,m],0); for (let i=0;i<n;i++) for (let j=0;j<m;j++) R[i][j]=A[i][j]*s; return R; }
+  function vectorNormInf(v){ let m=0; for (let i=0;i<v.length;i++){ const a=Math.abs(v[i]); if (a>m) m=a; } return m; }
+
+  function doBuckling(){
+    try{
+      const result = computeEulerBuckling();
+      const {Pcr} = result;
+      lastBuckling = result;
+      drawColumn(result);
+      // no popup UI; overlay shows values directly on canvas
+    }catch(err){
+      Swal.fire({icon:'error', title:'Buckling failed', text: String(err.message || err)});
+    }
+  }
+
+  // No-op chart function to avoid ReferenceError in this Euler-only build
+  function drawChart(_) { /* intentionally empty */ }
+
+  // ==== Utilities ====
+  document.getElementById('buildBtn').addEventListener('click', buildColumn);
+  document.getElementById('bucklingBtn').addEventListener('click', doBuckling);
+  // Clamp #segments input live to [1,5]
+  (function(){
+    const segInput = document.getElementById('numSegments');
+    ['input','change','blur'].forEach(ev=>segInput.addEventListener(ev, ()=>{
+      let v = parseInt(segInput.value)||1;
+      if (v < 1) v = 1; if (v > 5) v = 5; segInput.value = v;
+    }));
+  })();
+  // Other buttons removed for this streamlined build
+
+  function downloadCurrentHTML(){
+    const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+    const blob = new Blob([html], {type:'text/html'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'ColumnX.html';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // (Smoke tests — callable from console via runSmokeTests())
+  function runSmokeTests(){
+    const results = [];
+    function expect(name, ok){ results.push((ok?"✅":"❌")+" "+name); }
+
+    // Test 1: build & draw does not throw; correct counts
+    initModel(3); drawColumn();
+    expect('drawColumn ok', true);
+    expect('3 segments', clickTargets.filter(t=>t.type==='segment').length===3);
+    expect('4 nodes', clickTargets.filter(t=>t.type==='node').length===4);
+
+    // Test 2: analytic pinned-pinned
+    initModel(4);
+    for (let i=0;i<segments.length;i++){ segments[i].L=25; segments[i].E=12000000; segments[i].I=3; }
+    nodes[0].bc='simply supported'; nodes[nodes.length-1].bc='simply supported';
+    const outPP = computeEulerBuckling();
+    const EI=12000000*3, L=100; const Pth=Math.PI*Math.PI*EI/(L*L);
+    let relErr=Math.abs(outPP.Pcr-Pth)/Pth; expect('PP rel err < 7%', relErr<0.07);
+
+    // Test 3: fixed–fixed end rotations ~0
+    initModel(4);
+    for (let i=0;i<segments.length;i++){ segments[i].L=25; segments[i].E=210e9; segments[i].I=1e-6; }
+    nodes[0].bc='fixed'; nodes[nodes.length-1].bc='fixed';
+    const outFF = computeEulerBuckling();
+    const thTop=Math.abs(outFF.mode[1]); const thBot=Math.abs(outFF.mode[outFF.mode.length-1]);
+    expect('FF theta ends ~0', thTop<1e-9 && thBot<1e-9);
+
+    // Test 4: fixed–pinned analytic check (K≈0.699)
+    initModel(4);
+    for (let i=0;i<segments.length;i++){ segments[i].L=25; segments[i].E=210e9; segments[i].I=1e-6; }
+    nodes[0].bc='simply supported'; nodes[nodes.length-1].bc='fixed';
+    const outFP = computeEulerBuckling();
+    const Kfp = 0.699; const PthFP = Math.PI*Math.PI*(210e9*1e-6)/((Kfp*100)*(Kfp*100));
+    relErr=Math.abs(outFP.Pcr-PthFP)/PthFP; expect('Fixed–Pinned rel err < 7%', relErr<0.07);
+
+    console.log('\nSMOKE TESTS\n'+results.join('\n'));
+  }
+
+  // init
+  initModel(4);
+  drawColumn();
+  drawChart([]);
+  </script>
+</body>
+</html>
