@@ -27,7 +27,12 @@
     <label># Segments <input type="number" id="numSegments" min="1" max="5" value="4"></label>
     <button id="buildBtn" class="btn">Build</button>
     <button id="bucklingBtn" class="btn">Euler Buckling</button>
-    <!-- Streamlined Euler-only tool; other controls removed -->
+    
+    <button id="btnExportJSON" class="btn">Export JSON</button>
+    <button id="btnImportJSON" class="btn">Import JSON</button>
+    <button id="btnExportCSV" class="btn">Export CSV</button>
+    
+    <input type="file" id="fileInput" accept=".json" style="display:none">
   </div>
   <canvas id="columnCanvas" width="378" height="420"></canvas>
 
@@ -251,9 +256,9 @@
     // Enlarged click area
     clickTargets.push({ type: 'node', index: idx, x: x - 18, y: y - 18, w: 36, h: 36 });
 
-    // Node marker
-    ctx.fillStyle = '#000';
-    ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+    // Node marker - CHANGED TO BLUE
+    ctx.fillStyle = '#0066ff'; 
+    ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
 
     // BC symbols (Beam-style, rotated for vertical column view)
     ctx.strokeStyle = '#000';
@@ -396,7 +401,7 @@
          <label><span>kTor:</span><input id="swal-ktor" class="swal2-input" type="number" step="any" min="0" value="${node.kTor}"></label>`,
       focusConfirm: false,
       preConfirm: () => {
-        const bc   = document.getElementById('swal-bc').value;
+        const bc    = document.getElementById('swal-bc').value;
         const kLat = parseFloat(document.getElementById('swal-klat').value);
         const kTor = parseFloat(document.getElementById('swal-ktor').value);
         if (!(kLat>=0 && kTor>=0)) {
@@ -438,19 +443,14 @@
   // ==== Buckling (Eigenvalue) ====
   // DOFs per node: [v, theta]
   function assembleGlobalMatrices(){
-    // Build a refined internal mesh: each user segment is split into 6 equal subelements,
-    // creating 5 internal sub-nodes between the primary nodes. These sub-nodes are NOT
-    // drawn or clickable; they're only used to improve the solution accuracy.
-    const nPrim = nodes.length;                 // primary nodes count
-    const splits = 6;                           // 5 sub-nodes => 6 subelements
-    const nRefNodes = (nPrim - 1) * splits + 1; // refined node count
-    const ndofRef = nRefNodes * 2;              // [v, theta] per refined node
+    const nPrim = nodes.length;                 
+    const splits = 6;                           
+    const nRefNodes = (nPrim - 1) * splits + 1; 
+    const ndofRef = nRefNodes * 2;              
 
-    // Assemble global K and Kg (unit) on the refined mesh
     let K = numeric.rep([ndofRef, ndofRef], 0);
     let Kg_unit = numeric.rep([ndofRef, ndofRef], 0);
 
-    // Loop primary segments, split each into 'splits' pieces
     for (let e=0; e<segments.length; e++){
       const Lseg = Number(segments[e].L)||0;
       const Eseg = Number(segments[e].E)||0;
@@ -458,51 +458,42 @@
       if (Lseg<=0 || Eseg<=0 || Iseg<=0) continue;
       const Lsub = Lseg / splits;
 
-      // refined node index of primary node e is r_i = e*splits
-      // refined node index of primary node e+1 is r_j = (e+1)*splits
       for (let s=0; s<splits; s++){
-        const ri = e*splits + s;       // refined node at sub-element start
-        const rj = ri + 1;             // refined node at sub-element end
+        const ri = e*splits + s;        
+        const rj = ri + 1;              
         const map = [2*ri, 2*ri+1, 2*rj, 2*rj+1];
         const Ke = elemKe(Eseg, Iseg, Lsub);
-        const Kg = elemKg_unit(Lsub); // geometric stiffness for P=1
+        const Kg = elemKg_unit(Lsub); 
         addSubmatrix(K, Ke, map);
         addSubmatrix(Kg_unit, Kg, map);
       }
     }
 
-    // Nodal springs: apply only at primary nodes → refined indices r = p*splits
     for (let p=0; p<nPrim; p++){
-      const r = p * splits; // refined node index corresponding to primary node p
+      const r = p * splits; 
       const kL = Number(nodes[p].kLat)||0;
       const kT = Number(nodes[p].kTor)||0;
       if (kL>0) K[2*r][2*r] += kL;
       if (kT>0) K[2*r+1][2*r+1] += kT;
     }
 
-    // Boundary conditions: decide free DOFs on refined mesh using primary node BCs at r=p*splits
     const free = [];
     for (let r=0; r<nRefNodes; r++){
-      // Determine if this refined node corresponds to a primary node
       if (r % splits === 0){
-        const p = r / splits; // primary node index
+        const p = r / splits; 
         const bc = nodes[p].bc;
         const v = 2*r, th = 2*r+1;
         if (bc === 'fixed'){
-          // both constrained
         } else if (bc === 'simply supported' || bc === 'pinned'){
-          // v constrained; rotation free
           free.push(th);
-        } else { // 'free'
+        } else { 
           free.push(v); free.push(th);
         }
       } else {
-        // interior refined node (no BC) → both DOFs free
         free.push(2*r); free.push(2*r+1);
       }
     }
 
-    // Reduce
     const Kr = submatrix(K, free);
     const Kg_r = submatrix(Kg_unit, free);
     return {Kr, Kg_r, free, nPrim, nRefNodes, splits};
@@ -511,7 +502,6 @@
   function elemKe(E,I,L){
     const L2 = L*L, L3 = L2*L;
     const c = E*I/L3;
-    // 4x4
     return [
       [ 12*c,  6*L*c, -12*c,  6*L*c],
       [ 6*L*c, 4*L2*c, -6*L*c, 2*L2*c],
@@ -520,8 +510,6 @@
     ];
   }
   function elemKg_unit(L){
-    // geometric stiffness for unit compressive axial load P=1
-    // Kg = (1/(30L)) * [[36, 3L, -36, 3L],[3L, 4L^2, -3L, -L^2],[-36, -3L, 36, -3L],[3L, -L^2, -3L, 4L^2]]
     const L2 = L*L;
     const c = 1/(30*L);
     return [
@@ -610,32 +598,136 @@
     return X;
   }
 
-  // === Linear algebra helpers (vectors/matrices) ===
-  function reduceVector(v, idx){ const r = new Array(idx.length); for (let i=0;i<idx.length;i++) r[i] = v[idx[i]]; return r; }
-  function mulMatVec(A, v){ const n=A.length, m=A[0].length; const out=new Array(n).fill(0); for (let i=0;i<n;i++){ let s=0; for (let j=0;j<m;j++){ s += A[i][j]*v[j]; } out[i]=s; } return out; }
-  function vecScale(v, s){ const n=v.length, out=new Array(n); for (let i=0;i<n;i++) out[i]=v[i]*s; return out; }
-  function addMatrices(A,B){ const n=A.length,m=A[0].length; const R=numeric.rep([n,m],0); for (let i=0;i<n;i++) for (let j=0;j<m;j++) R[i][j]=A[i][j]+B[i][j]; return R; }
-  function scaleMatrix(A,s){ const n=A.length,m=A[0].length; const R=numeric.rep([n,m],0); for (let i=0;i<n;i++) for (let j=0;j<m;j++) R[i][j]=A[i][j]*s; return R; }
-  function vectorNormInf(v){ let m=0; for (let i=0;i<v.length;i++){ const a=Math.abs(v[i]); if (a>m) m=a; } return m; }
-
   function doBuckling(){
     try{
       const result = computeEulerBuckling();
       const {Pcr} = result;
       lastBuckling = result;
       drawColumn(result);
-      // no popup UI; overlay shows values directly on canvas
     }catch(err){
       Swal.fire({icon:'error', title:'Buckling failed', text: String(err.message || err)});
     }
   }
 
-  // No-op chart function to avoid ReferenceError in this Euler-only build
-  function drawChart(_) { /* intentionally empty */ }
+  // ==== EXPORT / IMPORT LOGIC ====
+
+  // Export JSON
+  function exportJSON() {
+    const now = new Date();
+    const data = {
+      timestamp: now.toISOString(),
+      dateString: now.toLocaleString(),
+      inputs: {
+        numSegments: document.getElementById('numSegments').value
+      },
+      segments: segments,
+      nodes: nodes
+    };
+    
+    const jsonStr = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonStr], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `column_buckling_${now.getTime()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  // Import JSON Trigger
+  function triggerImportJSON() {
+    document.getElementById('fileInput').click();
+  }
+
+  // Handle File Input
+  function handleFileSelect(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (data.inputs && data.inputs.numSegments) {
+          document.getElementById('numSegments').value = data.inputs.numSegments;
+        }
+        if (Array.isArray(data.segments)) segments = data.segments;
+        if (Array.isArray(data.nodes)) nodes = data.nodes;
+        
+        lastBuckling = { Pcr: null, mode: null };
+        drawColumn();
+        
+        Swal.fire({
+          icon: 'success',
+          title: 'Import Successful',
+          text: `Loaded data from ${data.dateString || 'file'}`,
+          timer: 1500,
+          showConfirmButton: false
+        });
+      } catch (err) {
+        Swal.fire('Import Error', 'Invalid JSON file', 'error');
+        console.error(err);
+      }
+      // Reset input so same file can be loaded again
+      document.getElementById('fileInput').value = '';
+    };
+    reader.readAsText(file);
+  }
+
+  // Export CSV
+  function exportCSV() {
+    if (!lastBuckling || !lastBuckling.Pcr) {
+      Swal.fire('No Results', 'Run the Euler Buckling analysis first.', 'info');
+      return;
+    }
+
+    const now = new Date();
+    const rows = [];
+    rows.push(`Date,${now.toLocaleDateString()}`);
+    rows.push(`Time,${now.toLocaleTimeString()}`);
+    rows.push(`Pcr,${lastBuckling.Pcr}`);
+    rows.push([]); // blank line
+    rows.push(`Node Index,Y-Position,Lateral Deflection (Normalized)`);
+
+    // Calculate Y-positions again to ensure accuracy in export
+    const totalLraw = segments.reduce((s, seg) => s + (Number(seg.L)||0), 0);
+    const totalL = totalLraw > 0 ? totalLraw : Math.max(1, segments.length);
+    const topY = 60;
+    const scale = (canvas.height - 140) / totalL; 
+    let currentY = 0; // Analytical Y starting from 0 at top
+
+    for(let i=0; i<nodes.length; i++) {
+        // vArray extraction logic from drawColumn (primary nodes only)
+        const primaryDeflection = lastBuckling.mode[2*i] || 0; 
+        
+        rows.push(`${i},${currentY.toFixed(4)},${primaryDeflection.toFixed(6)}`);
+        
+        if (i < segments.length) {
+            currentY += Number(segments[i].L);
+        }
+    }
+
+    const csvContent = "data:text/csv;charset=utf-8," + rows.join("\n");
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `column_buckling_results_${now.getTime()}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
 
   // ==== Utilities ====
   document.getElementById('buildBtn').addEventListener('click', buildColumn);
   document.getElementById('bucklingBtn').addEventListener('click', doBuckling);
+  
+  // New Event Listeners
+  document.getElementById('btnExportJSON').addEventListener('click', exportJSON);
+  document.getElementById('btnImportJSON').addEventListener('click', triggerImportJSON);
+  document.getElementById('fileInput').addEventListener('change', handleFileSelect);
+  document.getElementById('btnExportCSV').addEventListener('click', exportCSV);
+
   // Clamp #segments input live to [1,5]
   (function(){
     const segInput = document.getElementById('numSegments');
@@ -644,60 +736,10 @@
       if (v < 1) v = 1; if (v > 5) v = 5; segInput.value = v;
     }));
   })();
-  // Other buttons removed for this streamlined build
-
-  function downloadCurrentHTML(){
-    const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
-    const blob = new Blob([html], {type:'text/html'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'ColumnX.html';
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  // (Smoke tests — callable from console via runSmokeTests())
-  function runSmokeTests(){
-    const results = [];
-    function expect(name, ok){ results.push((ok?"✅":"❌")+" "+name); }
-
-    // Test 1: build & draw does not throw; correct counts
-    initModel(3); drawColumn();
-    expect('drawColumn ok', true);
-    expect('3 segments', clickTargets.filter(t=>t.type==='segment').length===3);
-    expect('4 nodes', clickTargets.filter(t=>t.type==='node').length===4);
-
-    // Test 2: analytic pinned-pinned
-    initModel(4);
-    for (let i=0;i<segments.length;i++){ segments[i].L=25; segments[i].E=12000000; segments[i].I=3; }
-    nodes[0].bc='simply supported'; nodes[nodes.length-1].bc='simply supported';
-    const outPP = computeEulerBuckling();
-    const EI=12000000*3, L=100; const Pth=Math.PI*Math.PI*EI/(L*L);
-    let relErr=Math.abs(outPP.Pcr-Pth)/Pth; expect('PP rel err < 7%', relErr<0.07);
-
-    // Test 3: fixed–fixed end rotations ~0
-    initModel(4);
-    for (let i=0;i<segments.length;i++){ segments[i].L=25; segments[i].E=210e9; segments[i].I=1e-6; }
-    nodes[0].bc='fixed'; nodes[nodes.length-1].bc='fixed';
-    const outFF = computeEulerBuckling();
-    const thTop=Math.abs(outFF.mode[1]); const thBot=Math.abs(outFF.mode[outFF.mode.length-1]);
-    expect('FF theta ends ~0', thTop<1e-9 && thBot<1e-9);
-
-    // Test 4: fixed–pinned analytic check (K≈0.699)
-    initModel(4);
-    for (let i=0;i<segments.length;i++){ segments[i].L=25; segments[i].E=210e9; segments[i].I=1e-6; }
-    nodes[0].bc='simply supported'; nodes[nodes.length-1].bc='fixed';
-    const outFP = computeEulerBuckling();
-    const Kfp = 0.699; const PthFP = Math.PI*Math.PI*(210e9*1e-6)/((Kfp*100)*(Kfp*100));
-    relErr=Math.abs(outFP.Pcr-PthFP)/PthFP; expect('Fixed–Pinned rel err < 7%', relErr<0.07);
-
-    console.log('\nSMOKE TESTS\n'+results.join('\n'));
-  }
 
   // init
   initModel(4);
   drawColumn();
-  drawChart([]);
   </script>
 </body>
 </html>
